@@ -1,7 +1,13 @@
 Name
 ====
 
-nginx-upsync-module - Nginx C module, nginx + consul server discovery service
+nginx-upsync-module - Nginx C module, sync upstreams from consul or others, dynamically modify backend-servers attribute(weight, max_fails,...), needn't reload nginx.
+
+It may not always be convenient to modify configuration files and restart NGINX. For example, if you are experiencing large amounts of traffic and high load, restarting NGINX and reloading the configuration at that point further increases load on the system and can temporarily degrade performance.
+
+The module can be more smoothly expansion and constriction, and will not influence the performance.
+
+Another module, [nginx-stream-upsync-module](https://github.com/xiaokai-wang/nginx-stream-upsync-module) supports nginx stream module(TCP protocol), please be noticed.
 
 Table of Contents
 =================
@@ -9,16 +15,23 @@ Table of Contents
 * [Name](#name)
 * [Status](#status)
 * [Synopsis](#synopsis)
-* [Description](#functions)
-* [Directives](#functions)
-    * [consul](#consul)
-    * [update_interval](#update_interval)
-    * [update_timeout](#update_timeout)
-    * [strong_dependency](#strong_dependency)
+* [Description](#description)
+* [Directives](#directives)
+    * [upsync](#upsync)
+        * [upsync_interval](#upsync_interval)
+        * [upsync_timeout](#upsync_timeout)
+        * [upsync_type](#upsync_type)
+        * [strong_dependency](#strong_dependency)
+    * [upsync_dump_path](#upsync_dump_path)
+    * [upsync_lb](#upsync_lb)
     * [upstream_show](#upstream_show)
+* [Consul_interface](#consul_interface)
+* [Etcd_interface](#etcd_interface)
+* [Check_module](#check_module_support)
 * [TODO](#todo)
 * [Compatibility](#compatibility)
 * [Installation](#installation)
+* [Code style](#code-style)
 * [Author](#author)
 * [Copyright and License](#copyright-and-license)
 * [See Also](#see-also)
@@ -32,18 +45,90 @@ This module is still under active development and is considered production ready
 Synopsis
 ========
 
-```nginx
+nginx-consul:
+```nginx-consul
 http {
     upstream test {
         # fake server otherwise ngx_http_upstream will report error when startup
         server 127.0.0.1:11111;
 
         # all backend server will pull from consul when startup and will delete fake server
-        consul 127.0.0.1:8500/v1/kv/upstreams/test update_timeout=6m update_interval=3s strong_dependency=off;
+        upsync 127.0.0.1:8500/v1/kv/upstreams/test/ upsync_timeout=6m upsync_interval=500ms upsync_type=consul strong_dependency=off;
+        upsync_dump_path /usr/local/nginx/conf/servers/servers_test.conf;
     }
 
     upstream bar {
-        server 127.0.0.1:8090 weight=1, fail_timeout=10, max_fails=3;
+        server 127.0.0.1:8090 weight=1 fail_timeout=10 max_fails=3;
+    }
+
+    server {
+        listen 8080;
+
+        location = /proxy_test {
+            proxy_pass http://test;
+        }
+
+        location = /bar {
+            proxy_pass http://bar;
+        }
+
+        location = /upstream_show {
+            upstream_show;
+        }
+
+    }
+}
+```
+nginx-etcd:
+```nginx-etcd
+http {
+    upstream test {
+        # fake server otherwise ngx_http_upstream will report error when startup
+        server 127.0.0.1:11111;
+
+        # all backend server will pull from etcd when startup and will delete fake server
+        upsync 127.0.0.1:2379/v2/keys/upstreams/test upsync_timeout=6m upsync_interval=500ms upsync_type=etcd strong_dependency=off;
+        upsync_dump_path /usr/local/nginx/conf/servers/servers_test.conf;
+    }
+
+    upstream bar {
+        server 127.0.0.1:8090 weight=1 fail_timeout=10 max_fails=3;
+    }
+
+    server {
+        listen 8080;
+
+        location = /proxy_test {
+            proxy_pass http://test;
+        }
+
+        location = /bar {
+            proxy_pass http://bar;
+        }
+
+        location = /upstream_show {
+            upstream_show;
+        }
+
+    }
+}
+```
+upsync_lb:
+```upsync_lb
+http {
+    upstream test {
+        least_conn; //hash $uri consistent;
+        # fake server otherwise ngx_http_upstream will report error when startup
+        server 127.0.0.1:11111;
+
+        # all backend server will pull from consul when startup and will delete fake server
+        upsync 127.0.0.1:8500/v1/kv/upstreams/test/ upsync_timeout=6m upsync_interval=500ms upsync_type=consul strong_dependency=off;
+        upsync_dump_path /usr/local/nginx/conf/servers/servers_test.conf;
+        upsync_lb least_conn; //hash_ketama;
+    }
+
+    upstream bar {
+        server 127.0.0.1:8090 weight=1 fail_timeout=10 max_fails=3;
     }
 
     server {
@@ -68,42 +153,79 @@ http {
 Description
 ======
 
-This module provides a method to discover backend servers. Supporting dynamicly adding or deleting backend server through consul, module will timely pull new backend server list from consul to update nginx ip router. Nginx needn't reload. Having some advantages than others:
+This module provides a method to discover backend servers. Supporting dynamicly adding or deleting backend server through consul or etcd and dynamically adjusting backend servers weight, module will timely pull new backend server list from consul or etcd to upsync nginx ip router. Nginx needn't reload. Having some advantages than others:
 
 * timely
 
-      module send key to consul with index, consul will compare it with its index, if index doesn't change connection will hang five minutes, in the period any operation to the key-value, will feed back rightaway.
+      module send key to consul/etcd with index, consul/etcd will compare it with its index, if index doesn't change connection will hang five minutes, in the period any operation to the key-value, will feed back rightaway.
 
 * performance
 
-      Pulling from consul equal a request to nginx, updating ip router nginx needn't reload, so affecting nginx performance is little.
+      Pulling from consul/etcd equal a request to nginx, updating ip router nginx needn't reload, so affecting nginx performance is little.
 
 * stability
 
-      Even if one pulling failed, it will pull next update_interval, so guaranteing backend server stably provides service.
+      Even if one pulling failed, it will pull next upsync_interval, so guarantying backend server stably provides service. And support dumping the latest config to location, so even if consul/etcd hung up, and nginx can be reload anytime. 
 
 * health_check
 
       nginx-upsync-module support adding or deleting servers health check, needing nginx_upstream_check_module. Recommending nginx-upsync-module + nginx_upstream_check_module.
 
-Diretives
+Directives
 ======
 
-consul
+upsync
 -----------
-`syntax: consul $consul.api.com:$port/v1/kv/upstreams/$upstream_name [update_interval=second/minutes] [update_timeout=second/minutes] [strong_dependency=off/on]`
-
-default: none, if parameters omitted, default parameters are update_interval=5s update_timeout=6m strong_dependency=off
+```
+syntax: upsync $consul/etcd.api.com:$port/v1/kv/upstreams/$upstream_name/ [upsync_type=consul/etcd] [upsync_interval=second/minutes] [upsync_timeout=second/minutes] [strong_dependency=off/on]
+```
+default: none, if parameters omitted, default parameters are upsync_interval=5s upsync_timeout=6m strong_dependency=off
 
 context: upstream
 
-description: Pull upstream servers from consul.
+description: Pull upstream servers from consul/etcd... .
 
 The parameters' meanings are:
 
-* update_interval: pulling servers from consul interval time.
-* update_timeout: pulling servers from consul request timeout.
-* strong_dependency: pulling servers from consul request timeout.
+* upsync_interval
+
+    pulling servers from consul/etcd interval time.
+
+* upsync_timeout
+
+    pulling servers from consul/etcd request timeout.
+
+* upsync_type
+
+    pulling servers from conf server type.
+
+* strong_dependency
+
+    when nginx start up if depending on consul/etcd, and consul/etcd is not working, nginx will boot failed, otherwise booting normally.
+
+[Back to TOC](#table-of-contents)       
+
+upsync_dump_path
+-----------
+`syntax: upsync_dump_path $path`
+
+default: /tmp/servers_$host.conf
+
+context: upstream
+
+description: dump the upstream backends to the $path.
+
+[Back to TOC](#table-of-contents)       
+
+upsync_lb
+-----------
+`syntax: upsync_lb $load_balance`
+
+default: round_robin/ip_hash/hash modula
+
+context: upstream
+
+description: mainly for least_conn and hash consistent, when using one of them, you must point out using upsync_lb.
 
 [Back to TOC](#table-of-contents)       
 
@@ -123,8 +245,164 @@ description: Show specific upstream all backend servers.
      }
 ```
 
-```request
+```request1
 curl http://127.0.0.1:8500/upstream_list?test;
+```
+
+```request2
+curl http://127.0.0.1:8500/upstream_list;
+
+show all upstreams.
+```
+
+[Back to TOC](#table-of-contents)       
+
+Consul_interface
+======
+
+Data can be taken from key/value store or service catalog. In the first case parameter upsync_type of directive must be *consul*. For example
+
+```nginx-consul
+        upsync 127.0.0.1:8500/v1/kv/upstreams/test upsync_timeout=6m upsync_interval=500ms upsync_type=consul strong_dependency=off;
+```
+
+In the second case it must be *consul_services*.
+
+```nginx-consul
+        upsync 127.0.0.1:8500/v1/catalog/service/test upsync_timeout=6m upsync_interval=500ms upsync_type=consul_services strong_dependency=off;
+```
+
+You can add or delete backend server through consul_ui or http_interface. Below are examples for key/value store.
+
+http_interface example:
+
+* add
+```
+    curl -X PUT http://$consul_ip:$port/v1/kv/upstreams/$upstream_name/$backend_ip:$backend_port
+```
+    default: weight=1 max_fails=2 fail_timeout=10 down=0 backup=0;
+
+```
+    curl -X PUT -d "{\"weight\":1, \"max_fails\":2, \"fail_timeout\":10}" http://$consul_ip:$port/v1/kv/$dir1/$upstream_name/$backend_ip:$backend_port
+or
+    curl -X PUT -d '{"weight":1, "max_fails":2, "fail_timeout":10}' http://$consul_ip:$port/v1/kv/$dir1/$upstream_name/$backend_ip:$backend_port
+```
+    value support json format.
+
+* delete
+```
+    curl -X DELETE http://$consul_ip:$port/v1/kv/upstreams/$upstream_name/$backend_ip:$backend_port
+```
+
+* adjust-weight
+```
+    curl -X PUT -d "{\"weight\":2, \"max_fails\":2, \"fail_timeout\":10}" http://$consul_ip:$port/v1/kv/$dir1/$upstream_name/$backend_ip:$backend_port
+or
+    curl -X PUT -d '{"weight":2, "max_fails":2, "fail_timeout":10}' http://$consul_ip:$port/v1/kv/$dir1/$upstream_name/$backend_ip:$backend_port
+```
+
+* mark server-down
+```
+    curl -X PUT -d "{\"weight\":2, \"max_fails\":2, \"fail_timeout\":10, \"down\":1}" http://$consul_ip:$port/v1/kv/$dir1/$upstream_name/$backend_ip:$backend_port
+or
+    curl -X PUT -d '{"weight":2, "max_fails":2, "fail_timeout":10, "down":1}' http://$consul_ip:$port/v1/kv/$dir1/$upstream_name/$backend_ip:$backend_port
+```
+
+* check
+```
+    curl http://$consul_ip:$port/v1/kv/upstreams/$upstream_name?recurse
+```
+
+[Back to TOC](#table-of-contents)       
+
+Etcd_interface
+======
+
+you can add or delete backend server through http_interface.
+
+mainly like etcd, http_interface example:
+
+* add
+```
+    curl -X PUT http://$etcd_ip:$port/v2/keys/upstreams/$upstream_name/$backend_ip:$backend_port
+```
+    default: weight=1 max_fails=2 fail_timeout=10 down=0 backup=0;
+
+```
+    curl -X PUT -d value="{\"weight\":1, \"max_fails\":2, \"fail_timeout\":10}" http://$etcd_ip:$port/v2/keys/$dir1/$upstream_name/$backend_ip:$backend_port
+```
+    value support json format.
+
+* delete
+```
+    curl -X DELETE http://$etcd_ip:$port/v2/keys/upstreams/$upstream_name/$backend_ip:$backend_port
+```
+
+* adjust-weight
+```
+    curl -X PUT -d "{\"weight\":2, \"max_fails\":2, \"fail_timeout\":10}" http://$etcd_ip:$port/v2/keys/$dir1/$upstream_name/$backend_ip:$backend_port
+```
+
+* mark server-down
+```
+    curl -X PUT -d value="{\"weight\":2, \"max_fails\":2, \"fail_timeout\":10, \"down\":1}" http://$etcd_ip:$port/v2/keys/$dir1/$upstream_name/$backend_ip:$backend_port
+```
+
+* check
+```
+    curl http://$etcd_ip:$port/v2/keys/upstreams/$upstream_name
+```
+
+[Back to TOC](#table-of-contents)       
+
+Check_module
+======
+
+check module support.
+
+check-conf:
+```check-conf
+http {
+    upstream test {
+        # fake server otherwise ngx_http_upstream will report error when startup
+        server 127.0.0.1:11111;
+
+        # all backend server will pull from consul when startup and will delete fake server
+        upsync 127.0.0.1:8500/v1/kv/upstreams/test/ upsync_timeout=6m upsync_interval=500ms upsync_type=consul strong_dependency=off;
+        upsync_dump_path /usr/local/nginx/conf/servers/servers_test.conf;
+
+        check interval=1000 rise=2 fall=2 timeout=3000 type=http default_down=false;
+        check_http_send "HEAD / HTTP/1.0\r\n\r\n";
+        check_http_expect_alive http_2xx http_3xx;
+
+    }
+
+    upstream bar {
+        server 127.0.0.1:8090 weight=1 fail_timeout=10 max_fails=3;
+    }
+
+    server {
+        listen 8080;
+
+        location = /proxy_test {
+            proxy_pass http://test;
+        }
+
+        location = /bar {
+            proxy_pass http://bar;
+        }
+
+        location = /upstream_show {
+            upstream_show;
+        }
+
+        location = /upstream_status {
+            check_status;
+            access_log off;
+        }
+
+    }
+}
 ```
 
 [Back to TOC](#table-of-contents)       
@@ -132,15 +410,16 @@ curl http://127.0.0.1:8500/upstream_list?test;
 TODO
 ====
 
-* timely resolve consul server domain, if it is domain
-* support least_conn load_balancing
+* support zookeeper and so on
 
 [Back to TOC](#table-of-contents)
 
 Compatibility
 =============
 
-The module was developed base on nginx1.8.0, but it is not embeded to the request process, so it can be used in any version of nginx theoretically. To be veryfied.
+Master branch is compatible with nginx-1.9+.
+
+The branch of nginx-upsync-1.8.x is compatible with Nginx-1.8.x and with tengine-2.2.0.
 
 [Back to TOC](#table-of-contents)
 
@@ -155,12 +434,28 @@ Grab the nginx source code from [nginx.org](http://nginx.org/), for example, the
 wget 'http://nginx.org/download/nginx-1.8.0.tar.gz'
 tar -xzvf nginx-1.8.0.tar.gz
 cd nginx-1.8.0/
+```
 
 ```bash
 ./configure --add-module=/path/to/nginx-upsync-module
 make
 make install
 ```
+
+if you support nginx-upstream-check-module
+```bash
+patch -p1 < /path/to/nginx-upstream-check-module/check_1.7.5+.patch
+./configure --add-module=/path/to/nginx-upstream-check-module --add-module=/path/to/nginx-upsync-module
+make
+make install
+```
+
+[Back to TOC](#table-of-contents)
+
+Code style
+======
+
+Code style is mainly based on [style](http://tengine.taobao.org/book/appendix_a.html)
 
 [Back to TOC](#table-of-contents)
 
@@ -196,14 +491,14 @@ see also
 ========
 * the nginx_upstream_check_module: https://github.com/alibaba/tengine/blob/master/src/http/ngx_http_upstream_check_module.c
 * the nginx_upstream_check_module patch: https://github.com/yaoweibin/nginx_upstream_check_module
-* the all project as a service base on docker:
+* or based on https://github.com/xiaokai-wang/nginx_upstream_check_module
 
 [back to toc](#table-of-contents)
 
 source dependency
 ========
 * Cjson: https://github.com/kbranigan/cJSON
-* http-parser: https://github.com/joyent/http-parser
+* http-parser: https://github.com/nodejs/http-parser
 
 [back to toc](#table-of-contents)
 
